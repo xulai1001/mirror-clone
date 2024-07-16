@@ -13,6 +13,8 @@ use serde::Deserialize;
 use slog::info;
 use std::io::Read;
 use structopt::StructOpt;
+use bytes::Bytes;
+use std::path::Path;
 
 #[derive(Deserialize, Debug)]
 pub struct CratesIoPackage {
@@ -28,10 +30,25 @@ pub struct CratesIo {
         default_value = "https://github.com/rust-lang/crates.io-index/archive/master.zip"
     )]
     pub zip_master: String,
+    #[structopt(long, default_value = "master.zip")]
+    pub with_local_master: String,
     #[structopt(long, default_value = "https://static.crates.io/crates")]
     pub crates_base: String,
     #[structopt(long)]
     pub debug: bool,
+}
+
+async fn get_or_download(conf: &CratesIo, mission: &Mission) -> Result<Bytes> {
+    if std::path::Path::new(&conf.with_local_master).exists() {
+        info!(mission.logger, "loading crates.io-index zip from {}...", conf.with_local_master);
+        let data = std::fs::read(&conf.with_local_master)?;
+        Ok(Bytes::from(data))
+    } else {
+        info!(mission.logger, "downloading crates.io-index from {}...", conf.zip_master);
+        let data = mission.client.get(&conf.zip_master).send().await?.bytes().await?;
+        std::fs::write(&conf.with_local_master, &data)?;
+        Ok(Bytes::from(data))
+    }
 }
 
 #[async_trait]
@@ -41,13 +58,12 @@ impl SnapshotStorage<SnapshotMeta> for CratesIo {
         mission: Mission,
         _config: &SnapshotConfig,
     ) -> Result<Vec<SnapshotMeta>> {
-        let logger = mission.logger;
-        let progress = mission.progress;
-        let client = mission.client;
+        let logger = &mission.logger;
+        let progress = &mission.progress;
+       // let client = mission.client;
 
-        info!(logger, "fetching crates.io-index zip...");
         progress.set_message("fetching crates.io-index zip...");
-        let data = client.get(&self.zip_master).send().await?.bytes().await?;
+        let data = get_or_download(&self, &mission).await?;
         let mut data = std::io::Cursor::new(data);
         let mut buf = vec![];
         let mut snapshot = vec![];
@@ -63,11 +79,8 @@ impl SnapshotStorage<SnapshotMeta> for CratesIo {
 
                     let mut de = serde_json::Deserializer::from_reader(&buf[..]);
                     while let Ok(package) = CratesIoPackage::deserialize(&mut de) {
-                        let url = format!(
-                            "{crate}/{crate}-{version}.crate",
-                            crate = package.name,
-                            version = package.vers
-                        );
+                        // 系统不同
+                        let url = Path::new(&package.name).join(format!("{}-{}.crate", package.name, package.vers)).to_str().unwrap().to_string();
                         if is_first {
                             progress.set_message(&url);
                             is_first = false;
